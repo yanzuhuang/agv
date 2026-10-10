@@ -7,7 +7,7 @@ python warehouse_agv.py --operation stop
 
 复用 warehouse_modbus.py（依赖 warehouse_plc.py）和 outbound_agv.py。
 上料：线体最后 2 秒与 AGV 滚筒同时运行；下料：最初 2 秒同时运行。
-上下料线体共用输入的运行时间，线体停止后存入指定 A 库库位。
+线体出货按输入的运行时间停止；入货由 PLC 物料检测结束，完成后存入指定 A 库库位。
 """
 
 import argparse
@@ -43,7 +43,7 @@ def parse_args(argv=None):
     parser.add_argument("--inbound-column", type=int, help="回库目标列号（1～6）")
     parser.add_argument("--inbound-level", type=int, help="回库目标层号（1～3）")
     parser.add_argument("--duration", "--line-duration", dest="duration", type=float,
-                        help="上下料共用的线体运行秒数，须大于2秒")
+                        help="线体出货运行秒数，须大于2秒；线体入货由PLC物料检测结束")
     parser.add_argument("--host", "--agv-host", default=agv.AGV_HOST)
     parser.add_argument("--port", "--agv-port", type=int, default=agv.AGV_PORT)
     parser.add_argument("--agv-id", type=int, default=1)
@@ -94,7 +94,7 @@ def parse_args(argv=None):
         ("device_id", "PLC Slave ID", int, 1, lambda v: 1 <= v <= 247),
         ("column", "A 库出库列号（1～6）", int, None, lambda v: 1 <= v <= 6),
         ("level", "A 库出库层号（1～3）", int, None, lambda v: 1 <= v <= 3),
-        ("duration", f"上下料线体运行秒数（大于 2，不超过 {args.action_timeout:g}）",
+        ("duration", f"线体出货运行秒数（大于 2，不超过 {args.action_timeout:g}）",
          float, None, lambda v: math.isfinite(v) and agv.LOAD_SECONDS < v <= args.action_timeout),
         ("roller_profile", "滚筒定义：word 反转上料04/下料01；pdf 反转上料02/下料03",
          str, None, lambda v: v in agv.ROLLER_PROFILES),
@@ -129,7 +129,7 @@ def print_plan(args):
     agv.log(f"A 库 {args.level} 层 {args.column} 列出货 -> 线体出货 {args.duration:g} 秒，最后2秒AGV上料，两者到时停止")
     agv.log(f"站点 1 上料 {agv.LOAD_SECONDS:g} 秒 -> 后退到站点 2 -> 前进到站点 1"
             f" -> 下料 {agv.UNLOAD_SECONDS:g} 秒")
-    agv.log(f"下料时线体入货（命令3）与滚筒同时启动，2秒停滚筒，{args.duration:g}秒停线体并确认空闲"
+    agv.log("下料时线体入货（命令3）与滚筒同时启动，2秒停滚筒，等待PLC检测物料到位后空闲，再清零"
             f" -> A 库 {args.inbound_level} 层 {args.inbound_column} 列入库（命令 4）")
     load, unload = agv.ROLLER_PROFILES[args.roller_profile]
     agv.log(f"滚筒定义 {args.roller_profile}：上料 0x{load:02X}，下料 0x{unload:02X}。")
@@ -150,6 +150,11 @@ class Conveyor:
         self.plc.begin(3)
         self.plc.wait_started()
 
+    def finish_receive(self):
+        # 与已验收的 WarehousePLC.line_inbound() 共用完成/清零逻辑。
+        # 启动和等待忙碌已由 start_receive 执行，期间允许 AGV 下料。
+        self.plc.finish()
+
     def stop_feed(self, wait=True):
         self.plc.clear_command()
         if wait:
@@ -160,7 +165,7 @@ class Conveyor:
 
 
 def deliver(client, plc, args, warehouse, *, hooks=None):
-    """仓库出库、重叠装卸、往返与回库；上下料共用线体时间。"""
+    """仓库出库、重叠装卸、往返与回库；出货计时，入货等待 PLC 完成。"""
     if hooks is not None:
         with agv.execution_hooks(hooks):
             return deliver(client, plc, args, warehouse)
@@ -209,9 +214,9 @@ def deliver(client, plc, args, warehouse, *, hooks=None):
     client.command(0x02, 0, "返回站点 1：停止行走")
     agv.require_stationary(client.status(), 1)
     agv.stage_event(4, "completed", "站点 1 到站停车已确认")
-    agv.stage_event(5, "running", "线体最初 2 秒与 AGV 下料重叠")
+    agv.stage_event(5, "running", "AGV 下料 2 秒；线体入货等待 PLC 物料到位")
     agv.transfer(client, 1, False, args, feeder)
-    agv.stage_event(5, "completed", "下料定时结束，线体空闲已确认")
+    agv.stage_event(5, "completed", "滚筒已停止；PLC 入货完成、空闲及清零已确认")
     agv.log("AGV 下料及线体入货结束，开始仓储入库。")
     agv.stage_event(6, "running", "A 库入库：等待忙碌后恢复空闲")
     warehouse.inbound(plc, args.inbound_column, args.inbound_level)

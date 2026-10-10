@@ -136,7 +136,7 @@ class MainWindow(QMainWindow):
         self.vertical_splitter.setStretchFactor(1, 1)
         self.vertical_splitter.setSizes([520, 130])
         footer = QHBoxLayout()
-        note = QLabel("请求停止将取消任务并清理连接；机械急停请使用设备上的急停按钮。")
+        note = QLabel("停止并退出：结束任务、清理连接后关闭程序；机械急停请使用设备急停按钮。")
         note.setObjectName("mutedLabel")
         note.setWordWrap(True)
         footer.addWidget(note, 1)
@@ -146,10 +146,9 @@ class MainWindow(QMainWindow):
         footer.addWidget(self.mode_combo)
         self.settings_button = QPushButton("系统设置")
         self.settings_button.clicked.connect(self.open_settings)
-        self.stop_button = QPushButton("请求停止")
+        self.stop_button = QPushButton("停止并退出")
         self.stop_button.setObjectName("stopButton")
-        self.stop_button.setEnabled(False)
-        self.stop_button.clicked.connect(self.request_stop)
+        self.stop_button.clicked.connect(self.stop_and_exit)
         self.start_button = QPushButton("开始模拟任务")
         self.start_button.setObjectName("primaryButton")
         self.start_button.clicked.connect(self.start_task)
@@ -189,7 +188,7 @@ class MainWindow(QMainWindow):
             level.valueChanged.connect(self._sync_grid)
         layout.addLayout(fields)
         duration_row = QHBoxLayout()
-        duration_row.addWidget(QLabel("线体时间 T"))
+        duration_row.addWidget(QLabel("出货时间 T"))
         self.duration_input = QDoubleSpinBox()
         self.duration_input.setDecimals(2)
         self.duration_input.setRange(0.01, 86400)
@@ -198,7 +197,7 @@ class MainWindow(QMainWindow):
         self.duration_input.setValue(core_agv.LINE_DURATION)
         duration_row.addWidget(self.duration_input, 1)
         layout.addLayout(duration_row)
-        timing = QLabel("T > 2 秒且不超过动作超时。\n上料重叠最后 2 秒，下料重叠最初 2 秒。")
+        timing = QLabel("出货 T > 2 秒，上料重叠最后 2 秒。\n下料滚筒运行 2 秒，线体入货由 PLC 检测结束。")
         timing.setObjectName("mutedLabel")
         timing.setWordWrap(True)
         layout.addWidget(timing)
@@ -384,7 +383,8 @@ class MainWindow(QMainWindow):
                       f"AGV  {settings.host}:{settings.port} · ID {settings.agv_id}\n\n"
                       f"A 库 {parameters.column}-{parameters.level} 出库 → AGV 往返 → "
                       f"{parameters.inbound_column}-{parameters.inbound_level} 入库\n"
-                      f"线体 T={parameters.duration:g} 秒 · 滚筒定义 {settings.roller_profile}\n"
+                      f"线体出货 T={parameters.duration:g} 秒 · 入货由 PLC 检测结束\n"
+                      f"滚筒定义 {settings.roller_profile}\n"
                       f"上料码 0x{core_agv.ROLLER_PROFILES[settings.roller_profile][0]:02X} · "
                       f"下料码 0x{core_agv.ROLLER_PROFILES[settings.roller_profile][1]:02X}\n"
                       f"物料 IO：{settings.material_input if settings.material_input is not None else '未配置，上料后人工确认'}\n\n"
@@ -418,7 +418,7 @@ class MainWindow(QMainWindow):
         self.task_badge.setProperty("result", "")
         refresh_style(self.task_badge)
         self._append_log("INFO", f"开始{self.mode_label}任务：{parameters.column}-{parameters.level} 出库 → "
-                         f"AGV 往返 → {parameters.inbound_column}-{parameters.inbound_level} 入库；T={parameters.duration:g} 秒。")
+                         f"AGV 往返 → {parameters.inbound_column}-{parameters.inbound_level} 入库；出货 T={parameters.duration:g} 秒，入货等待 PLC 完成。")
         self.controller.start(parameters, settings, time_scale=self.time_scale,
                               scenario=self.scenario_combo.currentData(), mode=mode,
                               real_confirmed=real_confirmed)
@@ -452,9 +452,14 @@ class MainWindow(QMainWindow):
         self.parameter_panel.setEnabled(not locked)
         self.start_button.setEnabled(not locked and not self._closing)
         self.scenario_combo.setEnabled(not locked and self.active_mode == "simulation")
-        self.stop_button.setEnabled(busy and not self._closing)
+        self.stop_button.setEnabled(not self._closing)
         for widget in (self.settings_button, self.top_settings_button, self.mode_combo):
             widget.setEnabled(not locked and not self._closing)
+
+    @Slot()
+    def stop_and_exit(self):
+        # 复用关闭窗口的取消、清理与线程退出路径，不强制结束进程。
+        self.close()
 
     @Slot()
     def request_stop(self):
@@ -613,8 +618,8 @@ class MainWindow(QMainWindow):
             self._set_busy(True)
             event.ignore()
         else:
+            self._closing = True
             if self.real_start_dialog is not None:
-                self._closing = True
                 self.real_start_dialog.reject()
             self._dismiss_confirmation()
             event.accept()

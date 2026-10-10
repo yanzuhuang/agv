@@ -76,19 +76,23 @@ class SimulationBackend:
         self.stage(index, "线体正在出货" if loading else "线体正在入货")
         self.require_material(not loading)
         self.device(plc_state="忙碌", state="停车等待上料" if loading else "停车等待下料")
-        self.log(f"收到模拟线体忙碌反馈，本次线体时长 T={self.parameters.duration:g} 秒（演示加速）")
+        self.log(f"收到模拟线体忙碌反馈，出货 T={self.parameters.duration:g} 秒（演示加速）"
+                 if loading else "收到模拟入货忙碌反馈，完成由模拟 PLC 物料到位事件决定")
         if loading:
             self.delay(self.parameters.duration - 2)
         self.control.checkpoint()
         self.publish(EventKind.STAGE, stage=index, status="running",
                      detail="AGV 反转上料中" if loading else "AGV 正转下料中")
         self.device(state="反转上料" if loading else "正转下料")
-        self.log("启动滚筒反转上料，最后 2 秒重叠" if loading else "启动滚筒正转下料，最初 2 秒重叠")
+        self.log("启动滚筒反转上料，最后 2 秒重叠" if loading else "启动滚筒正转下料 2 秒，线体入货等待 PLC 完成")
         self.delay(2)
         self.log("滚筒 2 秒计时结束，发送模拟停止；计时结束本身不证明交接完成")
         self.device(state="停站中", speed_percent=0)
         if not loading:
-            self.delay(self.parameters.duration - 2)
+            self.publish(EventKind.STAGE, stage=index, status="running", detail="滚筒已停止，等待模拟 PLC 物料到位")
+            # 独立注入 PLC 完成事件，不使用出货时间 T 推算入货完成。
+            self.delay(1)
+            self.log("收到模拟 PLC 物料到位、忙碌 → 空闲反馈，再清零入货命令")
         self.device(plc_state="空闲")
         self.log("线体命令清零，收到模拟空闲反馈")
         if loading and self.scenario == "loading_failure":

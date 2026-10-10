@@ -9,7 +9,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from outbound_agv import AGVClient, AGVError, Cancelled, deliver, main, parse_args, wait_at_station, wait_confirmation
 from outbound_agv import build_frame, transfer
@@ -340,17 +340,30 @@ class TimingTests(unittest.TestCase):
             with self.subTest(duration=duration), self.assertRaises(ValueError):
                 self.run_timed_transfer(True, duration)
 
-    def test_unload_overlaps_first_two_seconds_and_line_continues(self):
+    def test_unload_does_not_require_outfeed_duration(self):
+        args = self.args()
+        del args.line_duration
+        client, feeder = FakeAGV(), Mock()
+        client.material = True
+        clock = FakeClock()
+        with patch("outbound_agv.time", clock), contextlib.redirect_stdout(io.StringIO()):
+            transfer(client, 1, False, args, feeder)
+        self.assertAlmostEqual(clock.now, 2)
+        feeder.finish_receive.assert_called_once()
+        feeder.stop_feed.assert_not_called()
+
+    def test_unload_only_times_rollers_and_waits_for_plc_completion(self):
         for duration in (5, 8, 2.1):
             with self.subTest(duration=duration):
                 events, feeder = self.run_timed_transfer(False, duration, ack_delay=0.2)
                 self.assertEqual([(f, d) for _, f, d in events],
-                                 [("line", "receive"), (0x17, 3), (0x17, 0), ("line", "stop")])
-                for event, expected in zip(events, [0, 0, 2, duration]):
+                                 [("line", "receive"), (0x17, 3), (0x17, 0)])
+                for event, expected in zip(events, [0, 0, 2]):
                     self.assertAlmostEqual(event[0], expected)
                 feeder.start_feed.assert_not_called()
-                feeder.stop_feed.assert_called_once_with(wait=False)
-                feeder.wait_feed_stopped.assert_called_once()
+                feeder.stop_feed.assert_not_called()
+                feeder.wait_feed_stopped.assert_not_called()
+                feeder.finish_receive.assert_called_once()
 
 
 class FakePLC:
@@ -404,6 +417,17 @@ class WarehouseTests(unittest.TestCase):
         self.assertEqual(plc.writes.count((4, 1)), 1)
         self.assertEqual(plc.writes[-1], (4, 0))
         self.assertTrue(plc.closed)
+
+    def test_standalone_receive_waits_busy_then_idle_before_clear(self):
+        plc = FakePLC([(0, 1), (1, 0), (1, 0), (0, 1)])
+        warehouse = WarehouseOutbound(self.args(), plc)
+        with contextlib.redirect_stdout(io.StringIO()):
+            warehouse.start_receive()
+            self.assertEqual(plc.writes[-1], (4, 3))
+            self.assertTrue(warehouse.active)
+            warehouse.finish_receive()
+        self.assertEqual(plc.writes, [(4, 0), (4, 3), (4, 0)])
+        self.assertFalse(warehouse.active)
 
     def test_clear_failure_still_closes_connection(self):
         plc = FakePLC([])

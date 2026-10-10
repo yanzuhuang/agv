@@ -107,7 +107,7 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(window.mode_combo.currentData(), "simulation")
         self.assertEqual(window.duration_input.value(), 5)
         self.assertTrue(window.start_button.isEnabled())
-        self.assertFalse(window.stop_button.isEnabled())
+        self.assertTrue(window.stop_button.isEnabled())
         self.assertEqual(window.stage_states, ["waiting"] * 8)
 
     def test_chinese_font_is_available_for_actual_rendering(self):
@@ -232,7 +232,7 @@ class GuiTests(unittest.TestCase):
         self.assertIn("模拟完成", window.task_badge.text())
         self.assertTrue(window.start_button.isEnabled())
         self.assertTrue(window.parameter_panel.isEnabled())
-        self.assertFalse(window.stop_button.isEnabled())
+        self.assertTrue(window.stop_button.isEnabled())
         self.assertIn("站点 1", window.agv_labels["confirmed_station"].text())
         self.assertIn("24.50 V", window.agv_labels["voltage"].text())
         self.assertNotIn("%", window.agv_labels["voltage"].text())
@@ -552,6 +552,75 @@ class GuiTests(unittest.TestCase):
         window.close()
         self.wait_until(lambda: not window.controller.busy and not window.isVisible())
         self.assertTrue(client.closed and bus.closed)
+        self.assertIsNone(window.controller._thread)
+
+    def test_stop_button_exits_idle_without_creating_worker(self):
+        window = self.window()
+        QTest.mouseClick(window.stop_button, Qt.MouseButton.LeftButton)
+        self.assertFalse(window.isVisible())
+        self.assertIsNone(window.controller._thread)
+
+    def test_stop_button_exits_simulation_after_cleanup_and_thread_join(self):
+        window = self.window()
+        window.start_task()
+        self.wait_until(lambda: window.confirmation_dialog is not None)
+        # 确认窗口是模态窗口，用 click() 验证按钮信号连接。
+        window.stop_button.click()
+        self.assertTrue(window._closing)
+        self.assertFalse(window.start_button.isEnabled())
+        self.wait_until(lambda: not window.controller.busy and not window.isVisible())
+        self.assertTrue(window.controller.last_result.data["cleanup_ok"])
+        self.assertEqual(window.controller.last_result.data["outcome"], "cancelled")
+        self.assertIsNone(window.controller._thread)
+
+    def test_stop_button_during_real_infeed_clears_then_exits(self):
+        from test_agv_task import FakeClock
+        import outbound_agv
+        import warehouse_plc
+        window, client, bus = self.real_window()
+        self.auto_confirm(window.controller)
+        clock = FakeClock()
+        entered = threading.Event()
+        allow_read = threading.Event()
+        original_read = bus.read_holding_registers
+        def read(address, **kwargs):
+            if address == 0 and bus.command == 3 and bus.busy_seen:
+                entered.set()
+                if not allow_read.wait(2):
+                    raise TimeoutError("测试未释放入货反馈")
+            result = original_read(address, **kwargs)
+            if address == 0 and bus.command == 3:
+                bus.busy_seen = True
+            return result
+        bus.read_holding_registers = read
+        try:
+            with patch.object(outbound_agv, "time", clock), patch.object(warehouse_plc, "time", clock):
+                window.start_task()
+                window.real_start_button.click()
+                self.wait_until(entered.is_set)
+                window.stop_button.click()
+                self.assertTrue(window.isVisible())
+                self.assertTrue(window.controller.busy)
+                allow_read.set()
+                self.wait_until(lambda: not window.controller.busy and not window.isVisible())
+        finally:
+            allow_read.set()
+        self.assertEqual(window.controller.last_result.data["outcome"], "cancelled")
+        self.assertTrue(window.controller.last_result.data["cleanup_ok"])
+        self.assertEqual(bus.command, 0)
+        self.assertNotIn(4, [v for a, v, t in bus.writes if a == 4 and v])
+        self.assertTrue(client.closed and bus.closed)
+        self.assertIsNone(window.controller._thread)
+
+    def test_stop_button_exits_when_cleanup_fails_after_reporting_result(self):
+        window = self.window()
+        window.scenario_combo.setCurrentIndex(3)
+        window.start_task()
+        self.wait_until(lambda: window.confirmation_dialog is not None)
+        window.stop_button.click()
+        self.wait_until(lambda: not window.controller.busy and not window.isVisible())
+        self.assertEqual(window.controller.last_result.data["outcome"], "failed")
+        self.assertFalse(window.controller.last_result.data["cleanup_ok"])
         self.assertIsNone(window.controller._thread)
 
     def test_control_rejects_stale_answers_and_cancel_wakes_wait(self):

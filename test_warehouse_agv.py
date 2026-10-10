@@ -208,7 +208,7 @@ class CombinedWorkflowTests(unittest.TestCase):
     def test_line_inbound_failure_prevents_storage(self):
         import warehouse_modbus
 
-        self.plc.wait_status.side_effect = [None, TimeoutError("线体入货停止未确认")]
+        self.plc.finish.side_effect = TimeoutError("线体入货停止未确认")
         with patch.object(warehouse_modbus, "outbound"):
             with self.assertRaises(TimeoutError):
                 task.deliver(self.client, self.plc, self.args, warehouse_modbus)
@@ -244,7 +244,7 @@ class InitialPositionChecks(unittest.TestCase):
 
 
 class CombinedTimingTests(unittest.TestCase):
-    def test_complete_route_uses_same_duration_and_only_one_infeed(self):
+    def test_complete_route_times_outfeed_and_finishes_one_infeed_from_plc(self):
         for duration in (5, 8):
             with self.subTest(duration=duration):
                 args = task.parse_args([
@@ -264,6 +264,11 @@ class CombinedTimingTests(unittest.TestCase):
                 client.command = command
                 plc.begin.side_effect = lambda code: events.append((clock.now, "line", code))
                 plc.clear_command.side_effect = lambda: events.append((clock.now, "line", 0))
+                def finish_infeed():
+                    # 模拟独立的物料到位反馈，入货在开始 9 秒后完成。
+                    clock.sleep(7)
+                    events.append((clock.now, "line", 0))
+                plc.finish.side_effect = finish_infeed
                 warehouse.inbound.side_effect = lambda *a: events.append((clock.now, "store"))
                 with patch("outbound_agv.time.monotonic", side_effect=clock.monotonic), \
                         patch("outbound_agv.time.sleep", side_effect=clock.sleep), \
@@ -271,8 +276,8 @@ class CombinedTimingTests(unittest.TestCase):
                     task.deliver(client, plc, args, warehouse)
                 line = [event for event in events if event[1] == "line"]
                 self.assertEqual([event[2] for event in line], [2, 0, 3, 0])
-                for start, stop in (line[:2], line[2:]):
-                    self.assertAlmostEqual(stop[0] - start[0], duration)
+                self.assertAlmostEqual(line[1][0] - line[0][0], duration)
+                self.assertAlmostEqual(line[3][0] - line[2][0], 9)
                 load = next(e for e in events if e[1:] == ("agv", 0x17, 2))
                 unload = next(e for e in events if e[1:] == ("agv", 0x17, 3))
                 self.assertAlmostEqual(load[0] - line[0][0], duration - 2)
@@ -283,6 +288,7 @@ class CombinedTimingTests(unittest.TestCase):
                 self.assertGreater(events.index(next(e for e in events if e[1] == "store")),
                                    events.index(line[-1]))
                 plc.line_inbound.assert_not_called()
+                plc.finish.assert_called_once()
                 warehouse.inbound.assert_called_once_with(plc, 4, 3)
 
 

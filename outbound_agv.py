@@ -401,8 +401,8 @@ def wait_timed(deadline, feeder=None, feed_deadline=None):
 
 
 def transfer(client, station, is_loading, args, feeder=None, *, allow_initial_zero=False):
-    if feeder is not None and (not math.isfinite(args.line_duration) or args.line_duration <= LOAD_SECONDS):
-        raise ValueError("线体运行时间必须为大于2秒的有限数")
+    if feeder is not None and is_loading and (not math.isfinite(args.line_duration) or args.line_duration <= LOAD_SECONDS):
+        raise ValueError("线体出货运行时间必须为大于2秒的有限数")
     status = client.status()
     require_stationary(status, station, allow_initial_zero=allow_initial_zero)
     if args.material_input is not None and loaded(status, args) == is_loading:
@@ -414,17 +414,15 @@ def transfer(client, station, is_loading, args, feeder=None, *, allow_initial_ze
     if feeder is not None:
         if is_loading:
             feeder.start_feed()
-        else:
-            feeder.start_receive()
-        # 从观察到线体忙碌开始计时，上下料共用同一线体时长。
-        feed_deadline = time.monotonic() + args.line_duration
-        if is_loading:
+            # 只有出货按时长停止；从观察到线体忙碌开始计时。
+            feed_deadline = time.monotonic() + args.line_duration
             log(f"线体出货运行{args.line_duration:g}秒，最后{LOAD_SECONDS:g}秒AGV上料。")
             wait_timed(feed_deadline - LOAD_LEAD_SECONDS)
             if time.monotonic() >= feed_deadline:
                 raise AGVError("已错过线体上料时机，任务终止")
         else:
-            log(f"线体入货运行{args.line_duration:g}秒，最初{UNLOAD_SECONDS:g}秒AGV下料。")
+            feeder.start_receive()
+            log(f"线体入货由 PLC 物料检测结束，AGV 同时下料{UNLOAD_SECONDS:g}秒。")
     # 计时包含应答等待，不能收到应答后再额外延长运行时间。
     roller_deadline = time.monotonic() + duration
     if feeder is not None and is_loading:
@@ -433,9 +431,12 @@ def transfer(client, station, is_loading, args, feeder=None, *, allow_initial_ze
     wait_timed(roller_deadline, feeder if is_loading else None, feed_deadline)
     client.command(0x17, 0, f"{label}{duration:g}秒结束：停止滚筒")
     if feeder is not None:
-        if not is_loading:
-            wait_timed(feed_deadline, feeder, feed_deadline)
-        feeder.wait_feed_stopped()
+        if is_loading:
+            feeder.wait_feed_stopped()
+        else:
+            # start_receive 已确认忙碌；先等 PLC 空闲完成，再清零。
+            # action_timeout 仅限制等待上限，不是线体运行时长。
+            feeder.finish_receive()
     status = client.status()
     require_stationary(status, station, allow_initial_zero=allow_initial_zero)
     if args.material_input is not None and loaded(status, args) != is_loading:
@@ -563,6 +564,12 @@ class WarehouseOutbound:
         log("开启仓库线体入货（命令3），随即启动AGV下料2秒。")
         self.start(3)
 
+    def finish_receive(self):
+        self.wait(lambda state, ready: state == 0,
+                  self.args.action_timeout, "等待线体入货物料到位")
+        self.clear()
+        log("线体入货已由 PLC 确认完成，命令清0。")
+
     def check_feed(self):
         # 就绪只用于动作开始前；设备忙碌时就绪位可能变0。
         self.read()
@@ -605,7 +612,7 @@ def parse_args(argv=None):
     parser.add_argument("--timeout", type=float, default=5, help="每次通信超时秒数")
     parser.add_argument("--travel-timeout", type=float, default=180)
     parser.add_argument("--transfer-timeout", type=float, default=120, help="开始任务前现场准备确认的上限秒数；上料2秒、下料2秒")
-    parser.add_argument("--line-duration", type=float, default=LINE_DURATION, help="上下料共用线体运行秒数，默认5，须大于2秒；上料重叠最后2秒，下料重叠最初2秒")
+    parser.add_argument("--line-duration", type=float, default=LINE_DURATION, help="线体出货运行秒数，默认5，须大于2秒；上料重叠最后2秒，入货由PLC物料检测结束")
     parser.add_argument("--poll-interval", type=float, default=0.5)
     parser.add_argument("--dry-run", action="store_true", help="预览流程，完全不连接设备")
     parser.add_argument("--warehouse-outbound", dest="warehouse_outbound", action="store_true", default=True, help="仓库出库与AGV联动（搬运的默认模式）")
@@ -659,7 +666,7 @@ def print_plan(args):
             log(f"仓库 {args.plc_host}:{args.plc_port}，Slave ID={args.device_id}，A库{args.level}层{args.column}列")
             log("站点1准备确认 -> 仓库出库(命令1) -> 等待忙碌后空闲 -> 清0")
             log(f"上料：线体出货{args.line_duration:g}秒，最后2秒AGV上料，两者到时停止。")
-            log(f"下料：线体入货与AGV同时启动，2秒停滚筒，{args.line_duration:g}秒停线体。")
+            log("下料：线体入货与AGV同时启动，2秒停滚筒；等待PLC物料到位后空闲，再清零。")
         load_data, unload_data = ROLLER_PROFILES[args.roller_profile]
         log(f"实际站点1停车 -> 货物准备确认 -> 反转上料{LOAD_SECONDS:g}秒(17/{load_data:02X}) -> 滚筒停止")
         log("目标站点2(06/02) -> 后退(01/01) -> 确认站点2停车")

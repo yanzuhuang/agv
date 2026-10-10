@@ -47,4 +47,4 @@ class TaskParameters:
         if (not isinstance(self.duration, (int, float))
                 or not math.isfinite(self.duration)
                 or not 2 < self.duration <= settings.action_timeout):
-            raise ValueError("线体运行时间须大于 2 秒，且不超过动作超时。")
+            raise ValueError("线体出货运行时间须大于 2 秒，且不超过动作超时。")

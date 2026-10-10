@@ -27,6 +27,10 @@ class MemoryModbus:
         self.closed = False
         self.fail_connect = False
         self.fail_clear = False
+        # 独立于出货 T 的入货物料到位事件。
+        self.infeed_seconds = 7.0
+        self.infeed_started = None
+        self.infeed_reads = []
 
     def connect(self):
         return not self.fail_connect
@@ -40,6 +44,10 @@ class MemoryModbus:
             if self.command in (1, 4):
                 value = 0 if self.busy_seen else 1
                 self.busy_seen = True
+            elif self.command == 3:
+                elapsed = agv.time.monotonic() - self.infeed_started
+                value = int(elapsed < self.infeed_seconds)
+                self.infeed_reads.append((agv.time.monotonic(), value))
             else:
                 value = int(self.command in (2, 3))
         return Mock(registers=[value], isError=lambda: False)
@@ -51,6 +59,8 @@ class MemoryModbus:
                 raise TimeoutError("PLC 清零响应丢失")
             self.command = value
             self.busy_seen = False
+            if value == 3:
+                self.infeed_started = agv.time.monotonic()
         return Mock(isError=lambda: False)
 
 
@@ -164,10 +174,13 @@ class RealBackendTests(unittest.TestCase):
         roller_stops = [t for f, d, t in self.client.timed_commands if (f, d) == (23, 0)]
         self.assertAlmostEqual(roller_stops[1] - load, 2)
         self.assertAlmostEqual(roller_stops[2] - unload, 2)
-        for (command, start), next_action in zip(starts[1:3], (starts[2][1], starts[3][1])):
-            cleared = next(t for a, v, t in self.bus.writes if a == 4 and v == 0 and t >= start + 5)
-            self.assertAlmostEqual(cleared - start, 5)
-            self.assertGreaterEqual(next_action, cleared)
+        out_start, in_start = starts[1][1], starts[2][1]
+        out_clear = next(t for a, v, t in self.bus.writes if a == 4 and v == 0 and t >= out_start + 5)
+        in_clear = next(t for a, v, t in self.bus.writes if a == 4 and v == 0 and t >= in_start + 2)
+        self.assertAlmostEqual(out_clear - out_start, 5)
+        self.assertAlmostEqual(in_clear - in_start, 7, places=2)
+        self.assertGreaterEqual(starts[3][1], in_clear)
+        self.assertEqual(self.bus.infeed_reads[-1][1], 0)
         completed = [d["stage"] for k, d in self.events if k == EventKind.STAGE and d["status"] == "completed"]
         self.assertEqual(completed, list(range(7)))
         self.assertTrue(report["agv"]["travel_stationary"])
@@ -179,6 +192,54 @@ class RealBackendTests(unittest.TestCase):
     def test_without_material_io_requires_two_gui_confirmations(self):
         self.run_fast(self.backend(replace(self.settings, material_input=None, loaded_level=None)))
         self.assertEqual([d["key"] for k, d in self.events if k == EventKind.CONFIRMATION], ["prepare", "loaded"])
+
+    def test_infeed_clear_follows_plc_feedback_independently_of_outfeed_time(self):
+        for outfeed, infeed in ((5, 1), (5, 3), (5, 9), (8, 3), (8, 9)):
+            with self.subTest(outfeed=outfeed, infeed=infeed):
+                self.client, self.bus, self.clock = ConnectedFakeAGV(), MemoryModbus(), FakeClock()
+                self.control = TaskControl()
+                self.bus.infeed_seconds = infeed
+                self.parameters = replace(self.parameters, duration=outfeed)
+                self.run_fast(self.backend())
+                start_index = next(i for i, (a, v, t) in enumerate(self.bus.writes) if (a, v) == (4, 3))
+                start = self.bus.writes[start_index][2]
+                clear = next(t for a, v, t in self.bus.writes[start_index + 1:] if (a, v) == (4, 0))
+                self.assertAlmostEqual(clear - start, max(2, infeed), places=2)
+                self.assertEqual(self.bus.infeed_reads[0][1], 1)
+                self.assertEqual(self.bus.infeed_reads[-1][1], 0)
+                self.assertEqual(clear, self.bus.infeed_reads[-1][0])
+
+    def test_infeed_timeout_does_not_store_and_cleanup_clears_command(self):
+        self.parameters = replace(self.parameters, duration=2.1)
+        self.bus.infeed_seconds = 100
+        settings = replace(self.settings, action_timeout=3, plc_poll_interval=0.25)
+        backend = self.backend(settings)
+        with patch.object(agv, "time", self.clock), patch.object(warehouse_plc, "time", self.clock):
+            with self.assertRaisesRegex(warehouse_plc.WarehouseError, "等待动作完成.*超时"):
+                backend.run()
+            self.assertEqual(self.bus.command, 3)
+            self.assertNotIn(4, [v for a, v, t in self.bus.writes if a == 4 and v])
+            report = backend.cleanup()
+        self.assertTrue(report["plc_command_clear"])
+        self.assertEqual(self.bus.command, 0)
+        self.assertTrue(self.client.closed and self.bus.closed)
+
+    def test_cancel_while_waiting_infeed_does_not_store_and_cleans_both(self):
+        backend = self.backend()
+        read = self.bus.read_holding_registers
+        def cancel_read(address, **kwargs):
+            result = read(address, **kwargs)
+            if address == 0 and self.bus.command == 3 and len(self.bus.infeed_reads) >= 2:
+                self.control.cancel()
+            return result
+        self.bus.read_holding_registers = cancel_read
+        with patch.object(agv, "time", self.clock), patch.object(warehouse_plc, "time", self.clock):
+            with self.assertRaises(TaskCancelled):
+                backend.run()
+            report = backend.cleanup()
+        self.assertNotIn(4, [v for a, v, t in self.bus.writes if a == 4 and v])
+        self.assertTrue(report["plc_command_clear"])
+        self.assertTrue(report["agv"]["roller_stop_ack"])
 
     def test_waiting_confirmation_keeps_polling_and_alarm_aborts_before_outbound(self):
         self.auto_answer = False
