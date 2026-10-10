@@ -1,0 +1,53 @@
+# Python virtual environments and generated files
+agv_control/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Temporary files and local history backups
+tmp/
+temp/
+.tmp/
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Word and PDF documents (keep local copies)
+*.[dD][oO][cC]
+*.[dD][oO][cC][xX]
+*.[dD][oO][cC][mM]
+*.[dD][oO][tT]
+*.[dD][oO][tT][xX]
+*.[dD][oO][tT][mM]
+*.[rR][tT][fF]
+*.[pP][dD][fF]
+
+# Images, except the four icons required by the GUI
+*.[pP][nN][gG]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[gG][iI][fF]
+*.[bB][mM][pP]
+*.[wW][eE][bB][pP]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[iI][cC][oO]
+*.[hH][eE][iI][cC]
+*.[hH][eE][iI][fF]
+*.[aA][vV][iI][fF]
+*.[sS][vV][gG]
+!gui/assets/triangle-down-muted.svg
+!gui/assets/triangle-down.svg
+!gui/assets/triangle-up-muted.svg
+!gui/assets/triangle-up.svg
