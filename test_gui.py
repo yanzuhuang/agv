@@ -10,16 +10,16 @@ from tempfile import TemporaryDirectory
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PySide6.QtCore import QPoint, QTimer, Qt
 from PySide6.QtGui import QRawFont
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QStyle, QStyleOptionSpinBox
+from PySide6.QtWidgets import QLabel, QStyle, QStyleOptionSpinBox
 
 from gui.main import create_application
 from gui.main_window import MainWindow
-from gui.models import EventKind, TaskParameters
+from gui.models import AgvMoveParameters, AGV_STAGES, EventKind, TaskParameters
 from gui.settings import DeviceSettings, SettingsDialog, SettingsStore
 from gui.task_controller import TaskController
 from gui.task_worker import TaskCancelled, TaskControl, TaskWorker
@@ -622,6 +622,145 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(window.controller.last_result.data["outcome"], "failed")
         self.assertFalse(window.controller.last_result.data["cleanup_ok"])
         self.assertIsNone(window.controller._thread)
+
+    def test_single_control_defaults_to_station_one_and_preserves_warehouse_page(self):
+        window = self.window(configured=False)
+        self.assertEqual(window.task_type_combo.currentData(), "warehouse")
+        window.outbound_column.setValue(3)
+        window.task_type_combo.setCurrentIndex(1)
+        self.assertEqual(window.agv_target_input.value(), 1)
+        self.assertEqual(window.agv_direction_combo.currentData(), "forward")
+        self.assertEqual(window.task_parameters(), AgvMoveParameters())
+        self.assertEqual(window.stage_states, ["waiting"] * 4)
+        self.assertEqual([label.text() for label in window.stage_name_labels[:4]], list(AGV_STAGES))
+        self.assertFalse(window.storage_grid.isVisible())
+        self.assertIn("未参与", window.plc_badge.text())
+        self.assertFalse(window.station1_label.property("confirmed"))
+        window.task_type_combo.setCurrentIndex(0)
+        self.assertEqual(window.outbound_column.value(), 3)
+        self.assertEqual(window.stage_states, ["waiting"] * 8)
+        self.assertTrue(window.storage_grid.isVisible())
+
+    def test_single_simulation_ignores_warehouse_time_and_roller_selection(self):
+        window = self.window(configured=False)
+        window.task_type_combo.setCurrentIndex(1)
+        window.duration_input.setValue(1)
+        window.agv_target_input.setValue(7)
+        window.agv_direction_combo.setCurrentIndex(1)
+        window.start_task()
+        self.assertFalse(window.task_type_combo.isEnabled())
+        self.assertFalse(window.agv_target_input.isEnabled())
+        self.wait_until(lambda: window.confirmation_dialog is not None)
+        self.assertIn("目标站点 7", window.confirmation_dialog.findChildren(QLabel)[1].text())
+        window.confirm_button.click()
+        self.wait_until(lambda: not window.controller.busy)
+        self.assertEqual(window.stage_states, ["completed"] * 4)
+        self.assertEqual(window.controller.last_result.task_type, "agv_move")
+        self.assertIn("站点 7", window.agv_labels["confirmed_station"].text())
+        self.assertTrue(window.task_type_combo.isEnabled())
+
+    def test_single_real_preview_shows_only_agv_connection_and_can_cancel(self):
+        window = self.window(configured=False)
+        window.task_type_combo.setCurrentIndex(1)
+        window.mode_combo.setCurrentIndex(1)
+        window.agv_target_input.setValue(10)
+        window.start_task()
+        self.assertIsNotNone(window.real_start_dialog)
+        text = "\n".join(label.text() for label in window.real_start_dialog.findChildren(QLabel))
+        self.assertIn("目标站点 10", text)
+        self.assertIn(window.settings.host, text)
+        self.assertNotIn(window.settings.plc_host, text)
+        self.assertFalse(window.controller.busy)
+        window.real_start_dialog.reject()
+        self.assertTrue(window.start_button.isEnabled())
+
+    def single_real_window(self):
+        from gui.agv_move import RealAgvMoveBackend
+        from test_real_backend import ConnectedFakeAGV
+        client = ConnectedFakeAGV()
+        client.station = 2
+        plc = Mock(side_effect=AssertionError("单体任务不能创建 PLC"))
+        self.addCleanup(plc.assert_not_called)
+        factory = partial(RealAgvMoveBackend, agv_factory=lambda *a: client, plc_factory=plc)
+        controller = TaskController(agv_real_factory=factory)
+        self.controllers.append(controller)
+        self.store.save(DeviceSettings(poll_interval=0.001))
+        window = MainWindow(self.store, controller=controller)
+        self.windows.append(window)
+        window.show()
+        window.task_type_combo.setCurrentIndex(1)
+        window.mode_combo.setCurrentIndex(1)
+        return window, client
+
+    def test_single_real_gui_moves_to_arbitrary_station_in_worker(self):
+        from test_agv_task import FakeClock
+        import outbound_agv
+        window, client = self.single_real_window()
+        window.agv_target_input.setValue(17)
+        window.agv_direction_combo.setCurrentIndex(1)
+        with patch.object(outbound_agv, "time", FakeClock()):
+            window.start_task()
+            window.real_start_button.click()
+            self.wait_until(lambda: window.confirmation_dialog is not None)
+            window.confirm_button.click()
+            self.wait_until(lambda: not window.controller.busy)
+        self.assertEqual(window.stage_states, ["completed"] * 4)
+        self.assertEqual(window.controller.last_result.data["outcome"], "success")
+        self.assertIn((6, 17), client.commands)
+        self.assertIn((1, 1), client.commands)
+        self.assertEqual(window.agv_labels["raw_station"].text(), "17")
+        self.assertIn("站点 17", window.agv_labels["confirmed_station"].text())
+        self.assertEqual(window.station2_label.text(), "目标站点\n17")
+        self.assertIn("未参与", window.plc_badge.text())
+        self.assertIn("已断开", window.agv_badge.text())
+        self.assertNotIn(threading.get_ident(), client.command_threads)
+        self.assertTrue(client.closed)
+        window.resize(1366, 768)
+        QTest.qWait(10)
+        self.assertTrue(window.grab().save("tmp/gui-agv-single-real-fake.png"))
+
+    def test_single_stop_button_cleans_agv_then_exits(self):
+        window, client = self.single_real_window()
+        window.start_task()
+        window.real_start_button.click()
+        self.wait_until(lambda: window.confirmation_dialog is not None)
+        window.stop_button.click()
+        self.wait_until(lambda: not window.controller.busy and not window.isVisible())
+        self.assertEqual(window.controller.last_result.data["outcome"], "cancelled")
+        self.assertTrue(client.closed)
+        self.assertFalse(any(f == 1 for f, d in client.commands))
+        self.assertEqual(client.commands[-3:], [(2, 0), (23, 0), (6, 0)])
+        self.assertIsNone(window.controller._thread)
+
+    def test_single_and_warehouse_tasks_cannot_overlap(self):
+        controller = self.controller()
+        controller.start(AgvMoveParameters(), DeviceSettings(), time_scale=0.003)
+        self.assertFalse(controller.start(self.parameters, self.settings))
+        controller.cancel()
+        self.wait_until(lambda: not controller.busy)
+        controller.start(self.parameters, self.settings, time_scale=0.003)
+        self.assertFalse(controller.start(AgvMoveParameters(), DeviceSettings()))
+        controller.cancel()
+        self.wait_until(lambda: not controller.busy)
+
+    def test_single_real_cannot_start_without_explicit_confirmation(self):
+        controller = self.controller()
+        with self.assertRaisesRegex(ValueError, "明确确认"):
+            controller.start(AgvMoveParameters(), DeviceSettings(), mode="real")
+        self.assertIsNone(controller._thread)
+
+    def test_single_layout_aligns_panels_and_exports_previews(self):
+        window = self.window(configured=False)
+        window.task_type_combo.setCurrentIndex(1)
+        for width, height in ((1366, 768), (1920, 1080)):
+            window.resize(width, height)
+            QTest.qWait(15)
+            parameter_bottom = window.parameter_panel.mapTo(window, QPoint(0, window.parameter_panel.height())).y()
+            agv_bottom = window.agv_panel.mapTo(window, QPoint(0, window.agv_panel.height())).y()
+            self.assertLessEqual(abs(parameter_bottom - agv_bottom), 1)
+            self.assertTrue(window.agv_target_input.isVisible())
+            self.assertEqual(sum(row.isVisible() for row, detail, state in window.stage_rows), 4)
+            self.assertTrue(window.grab().save(f"tmp/gui-agv-single-{width}x{height}.png"))
 
     def test_control_rejects_stale_answers_and_cancel_wakes_wait(self):
         control = TaskControl()

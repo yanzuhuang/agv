@@ -6,7 +6,7 @@ import queue
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from .models import EventKind, TaskEvent
+from .models import EventKind, STAGES, TaskEvent
 
 
 class TaskCancelled(Exception):
@@ -109,11 +109,13 @@ class TaskWorker(QObject):
         self.options = options
         self.current_stage = 0
         self.mode = mode
+        self.task_type = getattr(parameters, "task_type", "warehouse")
+        self.cleanup_stage = len(getattr(parameters, "stages", STAGES)) - 1
 
     def publish(self, kind, **data):
         if kind == EventKind.STAGE and data["status"] == "running":
             self.current_stage = data["stage"]
-        self.event.emit(TaskEvent(kind, dict(data), mode=self.mode))
+        self.event.emit(TaskEvent(kind, dict(data), mode=self.mode, task_type=self.task_type))
 
     @Slot()
     def run(self):
@@ -122,6 +124,9 @@ class TaskWorker(QObject):
         label = "模拟" if self.mode == "simulation" else "真实设备"
         if self.mode == "real":
             message = "完整流程已完成；请现场核对物料和滚筒停止状态。"
+        if self.task_type == "agv_move":
+            message = ("模拟 AGV 单体到站任务已完成；未连接真实设备。" if self.mode == "simulation"
+                       else "AGV 指定站点到站停车已确认；连接清理结束。")
         cleanup_ok = False
         backend = None
         report = {}
@@ -139,19 +144,19 @@ class TaskWorker(QObject):
             self.publish(EventKind.STAGE, stage=self.current_stage, status="failed", detail=message)
             self.publish(EventKind.LOG, level="ERROR", message=message)
         finally:
-            self.publish(EventKind.STAGE, stage=7, status="running", detail=f"正在清理{label}资源")
+            self.publish(EventKind.STAGE, stage=self.cleanup_stage, status="running", detail=f"正在清理{label}资源")
             try:
                 if backend is not None:
                     report = backend.cleanup() or {}
                 cleanup_ok = True
                 cleanup_message = ("模拟资源已清理；没有真实设备连接。" if self.mode == "simulation"
                                    else "停止指令和连接清理已处理；滚筒机械停止需现场核对。")
-                self.publish(EventKind.STAGE, stage=7, status="completed", detail=f"{label}资源已清理")
+                self.publish(EventKind.STAGE, stage=self.cleanup_stage, status="completed", detail=f"{label}资源已清理")
                 self.publish(EventKind.CLEANUP, ok=True, message=cleanup_message, report=report)
             except Exception as exc:
                 report = getattr(exc, "report", report)
                 outcome, message = "failed", f"{label}清理失败：{exc}"
-                self.publish(EventKind.STAGE, stage=7, status="failed", detail=message)
+                self.publish(EventKind.STAGE, stage=self.cleanup_stage, status="failed", detail=message)
                 self.publish(EventKind.CLEANUP, ok=False, message=message, report=report)
                 self.publish(EventKind.LOG, level="ERROR", message=message)
             if outcome == "success" and self.control.cancelled:

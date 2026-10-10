@@ -2,7 +2,8 @@
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 
-from .models import EventKind
+from .models import AgvMoveParameters, EventKind
+from .agv_move import RealAgvMoveBackend, SimulationAgvMoveBackend
 from .simulation import SimulationBackend
 from .real_backend import RealBackend
 from .task_worker import TaskControl, TaskWorker
@@ -13,10 +14,13 @@ class TaskController(QObject):
     busy_changed = Signal(bool)
     task_finished = Signal(object)
 
-    def __init__(self, parent=None, backend_factory=SimulationBackend, real_factory=RealBackend):
+    def __init__(self, parent=None, backend_factory=SimulationBackend, real_factory=RealBackend,
+                 agv_simulation_factory=SimulationAgvMoveBackend, agv_real_factory=RealAgvMoveBackend):
         super().__init__(parent)
         self.backend_factory = backend_factory
         self.real_factory = real_factory
+        self.agv_simulation_factory = agv_simulation_factory
+        self.agv_real_factory = agv_real_factory
         self.busy = False
         self.last_result = None
         self._thread = None
@@ -37,6 +41,9 @@ class TaskController(QObject):
         self._thread.setObjectName("SimulationTask" if mode == "simulation" else "RealDeviceTask")
         factory = self.backend_factory if mode == "simulation" else self.real_factory
         options = {"time_scale": time_scale, "scenario": scenario} if mode == "simulation" else {}
+        if isinstance(parameters, AgvMoveParameters):
+            factory = self.agv_simulation_factory if mode == "simulation" else self.agv_real_factory
+            options = {"time_scale": time_scale} if mode == "simulation" else {}
         self._worker = TaskWorker(parameters, settings, self._control, factory, options, mode)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)

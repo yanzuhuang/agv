@@ -8,12 +8,12 @@ from PySide6.QtGui import QColor, QPainter, QTextCursor
 from PySide6.QtWidgets import (
     QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFrame,
     QGridLayout, QHBoxLayout, QLabel, QMainWindow, QPushButton, QRadioButton,
-    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTextEdit, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 import outbound_agv as core_agv
 
-from .models import EventKind, STAGES, TaskParameters
+from .models import AgvMoveParameters, AGV_STAGES, EventKind, STAGES, TaskParameters
 from .settings import SettingsDialog, SettingsStore
 from .simulation import SCENARIOS
 from .storage_grid import StorageGrid, refresh_style
@@ -82,6 +82,8 @@ class MainWindow(QMainWindow):
         self.controller = controller or TaskController(self)
         self.time_scale = time_scale
         self.stage_states = ["waiting"] * len(STAGES)
+        self.current_stages = STAGES
+        self.active_task_type = "warehouse"
         self.device_values = {}
         self.confirmation_dialog = None
         self.settings_dialog = None
@@ -140,6 +142,10 @@ class MainWindow(QMainWindow):
         note.setObjectName("mutedLabel")
         note.setWordWrap(True)
         footer.addWidget(note, 1)
+        self.task_type_combo = QComboBox()
+        self.task_type_combo.addItem("仓储完整流程", "warehouse")
+        self.task_type_combo.addItem("AGV 单体到站", "agv_move")
+        footer.addWidget(self.task_type_combo)
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("模拟模式", "simulation")
         self.mode_combo.addItem("真实设备模式", "real")
@@ -159,6 +165,7 @@ class MainWindow(QMainWindow):
         self.controller.busy_changed.connect(self._set_busy)
         self.controller.task_finished.connect(self._task_finished)
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        self.task_type_combo.currentIndexChanged.connect(self._task_type_changed)
         self._append_log("INFO", "模拟模式已就绪；真实设备需明确选择模式并确认启动后才连接。")
         if self.store.load_error:
             self._append_log("WARNING", self.store.load_error)
@@ -168,7 +175,14 @@ class MainWindow(QMainWindow):
                     min(screen.height(), max(580, min(850, int(screen.height() * 0.90)))))
 
     def _build_parameters(self):
-        panel, layout = card("任务参数 · A 库")
+        panel, outer_layout = card("任务参数 · A 库")
+        self.parameter_title = outer_layout.itemAt(0).widget()
+        self.parameter_stack = QStackedWidget()
+        outer_layout.addWidget(self.parameter_stack, 1)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.parameter_stack.addWidget(page)
         layout.setSpacing(6)
         fields = QGridLayout()
         fields.setSpacing(6)
@@ -233,15 +247,52 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.validation_label)
         layout.addStretch()
         self._sync_grid()
+        self.parameter_stack.addWidget(self._build_agv_parameters())
         return panel
+
+    def _build_agv_parameters(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel("控制 AGV 前往指定站点"))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("目标站点"))
+        self.agv_target_input = QSpinBox()
+        self.agv_target_input.setRange(1, 255)
+        self.agv_target_input.setValue(1)
+        self.agv_target_input.setPrefix("站点 ")
+        row.addWidget(self.agv_target_input, 1)
+        layout.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("行走方向"))
+        self.agv_direction_combo = QComboBox()
+        self.agv_direction_combo.addItem("前进", "forward")
+        self.agv_direction_combo.addItem("后退", "backward")
+        row.addWidget(self.agv_direction_combo, 1)
+        layout.addLayout(row)
+        self.agv_move_error = QLabel()
+        self.agv_move_error.setObjectName("errorLabel")
+        self.agv_move_error.setWordWrap(True)
+        self.agv_move_error.hide()
+        layout.addWidget(self.agv_move_error)
+        notice = QLabel("默认目标为站点 1。\n\n按现场路线选择前进或后退；站点编号不能用于推算方向。\n\n"
+                        "单体控制只连接 AGV，不执行仓库出入库或滚筒装卸。\n\n"
+                        "到站需连续两次目标站点、零速度和停站反馈，再停止复核。")
+        notice.setObjectName("mutedLabel")
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        layout.addStretch()
+        return page
 
     def _build_stages(self):
         panel, layout = card("完整流程监控")
+        self.stage_title = layout.itemAt(0).widget()
         layout.setSpacing(4)
         self.plc_feedback = QLabel("PLC 反馈：尚无模拟反馈")
         self.plc_feedback.setObjectName("mutedLabel")
         layout.addWidget(self.plc_feedback)
         self.stage_rows = []
+        self.stage_name_labels = []
         for index, title in enumerate(STAGES):
             row = QFrame()
             row.setProperty("stageState", "waiting")
@@ -252,6 +303,7 @@ class MainWindow(QMainWindow):
             number.setObjectName("stageNumber")
             line.addWidget(number)
             name = QLabel(title)
+            self.stage_name_labels.append(name)
             name.setMinimumWidth(150)
             line.addWidget(name)
             detail = QLabel("等待任务事件")
@@ -337,6 +389,8 @@ class MainWindow(QMainWindow):
         return panel
 
     def task_parameters(self):
+        if self.active_task_type == "agv_move":
+            return AgvMoveParameters(self.agv_target_input.value(), self.agv_direction_combo.currentData())
         return TaskParameters(self.outbound_column.value(), self.outbound_level.value(),
                               self.inbound_column.value(), self.inbound_level.value(),
                               self.duration_input.value())
@@ -359,12 +413,15 @@ class MainWindow(QMainWindow):
             parameters = self.task_parameters()
             parameters.validate(self.settings)
         except ValueError as exc:
-            self.validation_label.setText(str(exc))
-            self.validation_label.show()
+            error = self.agv_move_error if self.active_task_type == "agv_move" else self.validation_label
+            error.setText(str(exc))
+            error.show()
             self._append_log("WARNING", str(exc))
             return
         self.validation_label.clear()
         self.validation_label.hide()
+        self.agv_move_error.clear()
+        self.agv_move_error.hide()
         if self.mode_combo.currentData() == "real":
             self._confirm_real_start(parameters)
             return
@@ -378,7 +435,14 @@ class MainWindow(QMainWindow):
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.setMinimumWidth(460)
         layout = QVBoxLayout(dialog)
-        text = QLabel(f"将连接并控制以下设备：\n"
+        if isinstance(parameters, AgvMoveParameters):
+            text = QLabel(f"将连接 AGV  {settings.host}:{settings.port} · ID {settings.agv_id}\n\n"
+                          f"目标站点 {parameters.target_station} · 方向{parameters.direction_text}\n"
+                          f"到站等待上限 {settings.travel_timeout:g} 秒\n\n"
+                          "只执行 AGV 单体行走，不连接仓储 PLC。\n"
+                          "连接后检查停车与报警，并要求确认行走路线和物料固定条件。")
+        else:
+            text = QLabel(f"将连接并控制以下设备：\n"
                       f"PLC  {settings.plc_host}:{settings.plc_port} · Slave {settings.device_id}\n"
                       f"AGV  {settings.host}:{settings.port} · ID {settings.agv_id}\n\n"
                       f"A 库 {parameters.column}-{parameters.level} 出库 → AGV 往返 → "
@@ -412,13 +476,16 @@ class MainWindow(QMainWindow):
         self.active_mode = mode
         self.device_values.clear()
         self._update_device({})
-        for index in range(len(STAGES)):
+        for index in range(len(self.current_stages)):
             self._update_stage(index, "waiting", "等待任务事件")
         self.task_badge.setText(f"任务 · {self.mode_label}运行中")
         self.task_badge.setProperty("result", "")
         refresh_style(self.task_badge)
-        self._append_log("INFO", f"开始{self.mode_label}任务：{parameters.column}-{parameters.level} 出库 → "
-                         f"AGV 往返 → {parameters.inbound_column}-{parameters.inbound_level} 入库；出货 T={parameters.duration:g} 秒，入货等待 PLC 完成。")
+        if isinstance(parameters, AgvMoveParameters):
+            self._append_log("INFO", f"开始{self.mode_label} AGV 单体任务：{parameters.direction_text}前往站点 {parameters.target_station}。")
+        else:
+            self._append_log("INFO", f"开始{self.mode_label}任务：{parameters.column}-{parameters.level} 出库 → "
+                             f"AGV 往返 → {parameters.inbound_column}-{parameters.inbound_level} 入库；出货 T={parameters.duration:g} 秒，入货等待 PLC 完成。")
         self.controller.start(parameters, settings, time_scale=self.time_scale,
                               scenario=self.scenario_combo.currentData(), mode=mode,
                               real_confirmed=real_confirmed)
@@ -431,29 +498,47 @@ class MainWindow(QMainWindow):
     def _mode_changed(self):
         self.active_mode = self.mode_combo.currentData()
         self.setWindowTitle(f"仓储 AGV 联动控制系统 · {self.mode_label}模式")
-        self.banner.setText("模拟模式  ·  不连接或控制真实 PLC / AGV  ·  演示时间已缩短，确认仍需人工操作"
-                            if self.active_mode == "simulation" else
-                            "真实设备模式  ·  启动前需明确确认设备参数  ·  装卸使用实际秒数  ·  请在现场核对物料状态")
-        self.start_button.setText(f"开始{self.mode_label}任务")
-        self.scenario_combo.setEnabled(self.active_mode == "simulation")
+        if self.active_mode == "simulation":
+            self.banner.setText("模拟模式  ·  不连接或控制真实 PLC / AGV  ·  演示时间已缩短，确认仍需人工操作")
+        else:
+            self.banner.setText("真实 AGV 单体模式  ·  核对目标站点和行走方向后启动  ·  仅连接 AGV"
+                                if self.active_task_type == "agv_move" else
+                                "真实设备模式  ·  启动前需明确确认设备参数  ·  装卸使用实际秒数  ·  请在现场核对物料状态")
+        self.start_button.setText(f"开始{self.mode_label}{'单体行走' if self.active_task_type == 'agv_move' else '任务'}")
+        self.scenario_combo.setEnabled(self.active_mode == "simulation" and self.active_task_type == "warehouse")
         self.agv_title.setText(f"AGV 状态 · 离散站点示意（{self.mode_label}）")
         self.logs_title.setText(f"运行日志 · {self.mode_label}事件")
         self.device_values.clear()
         self._update_device({})
-        for index in range(len(STAGES)):
+        for index in range(len(self.current_stages)):
             self._update_stage(index, "waiting", "等待任务事件")
         self.task_badge.setText(f"任务 · 待机（{self.mode_label}）")
         self.task_badge.setProperty("result", "")
         refresh_style(self.task_badge)
+
+    @Slot()
+    def _task_type_changed(self):
+        self.active_task_type = self.task_type_combo.currentData()
+        single = self.active_task_type == "agv_move"
+        self.parameter_stack.setCurrentIndex(1 if single else 0)
+        self.parameter_title.setText("任务参数 · AGV 单体" if single else "任务参数 · A 库")
+        self.stage_title.setText("AGV 单体控制监控" if single else "完整流程监控")
+        self.current_stages = AGV_STAGES if single else STAGES
+        self.stage_states = ["waiting"] * len(self.current_stages)
+        for index, (row, detail, state) in enumerate(self.stage_rows):
+            row.setVisible(index < len(self.current_stages))
+            if index < len(self.current_stages):
+                self.stage_name_labels[index].setText(self.current_stages[index])
+        self._mode_changed()
 
     @Slot(bool)
     def _set_busy(self, busy):
         locked = busy or self.real_start_dialog is not None
         self.parameter_panel.setEnabled(not locked)
         self.start_button.setEnabled(not locked and not self._closing)
-        self.scenario_combo.setEnabled(not locked and self.active_mode == "simulation")
+        self.scenario_combo.setEnabled(not locked and self.active_mode == "simulation" and self.active_task_type == "warehouse")
         self.stop_button.setEnabled(not self._closing)
-        for widget in (self.settings_button, self.top_settings_button, self.mode_combo):
+        for widget in (self.settings_button, self.top_settings_button, self.mode_combo, self.task_type_combo):
             widget.setEnabled(not locked and not self._closing)
 
     @Slot()
@@ -502,13 +587,15 @@ class MainWindow(QMainWindow):
     def _update_device(self, values):
         self.device_values.update(values)
         data = self.device_values
-        self.plc_badge.setText("仓库 PLC · " + ("模拟模式" if self.active_mode == "simulation" else data.get("plc_connection", "未连接")))
+        single = self.active_task_type == "agv_move"
+        self.plc_badge.setText("仓库 PLC · " + ("未参与" if single else "模拟模式" if self.active_mode == "simulation" else data.get("plc_connection", "未连接")))
         self.agv_badge.setText("AGV · " + ("模拟模式" if self.active_mode == "simulation" else data.get("agv_connection", "未连接")))
         ready = data.get("plc_ready")
         ready_text = "是" if ready is True else "否" if ready is False else "—"
         if data.get("plc_ready_raw", 1) not in (0, 1):
             ready_text = f"异常值 {data['plc_ready_raw']}"
-        self.plc_feedback.setText(f"PLC 反馈（{self.mode_label}）：{data.get('plc_state', '—')}  ·  就绪：{ready_text}")
+        self.plc_feedback.setText("AGV 单体任务 · 仓储 PLC 不参与" if single else
+                                  f"PLC 反馈（{self.mode_label}）：{data.get('plc_state', '—')}  ·  就绪：{ready_text}")
         confirmed, target = data.get("confirmed_station"), data.get("target_station")
         transit = data.get("in_transit", False)
         self.agv_icon.set_moving(transit)
@@ -524,15 +611,25 @@ class MainWindow(QMainWindow):
                 text = str(value) if value is not None else "—"
             label.setText(text)
         if transit:
-            direction = "前往站点 2" if target == 2 else "返回站点 1" if target == 1 else "移动 / 状态待核对"
+            direction = (f"{self.agv_direction_combo.currentText()}前往站点 {target}" if single and target is not None
+                         else "前往站点 2" if target == 2 else "返回站点 1" if target == 1 else "移动 / 状态待核对")
             self.route_label.setText(f"AGV · {direction}\n无连续位置坐标（{self.mode_label}）")
         elif confirmed is not None:
             suffix = "\n最后一次任务反馈" if data.get("agv_connection") == "已断开" else ""
             self.route_label.setText(f"AGV · 站点 {confirmed} 已确认（{self.mode_label}）{suffix}")
         else:
             self.route_label.setText(f"←  AGV 等待{self.mode_label}反馈  →")
-        for number, label in ((1, self.station1_label), (2, self.station2_label)):
-            label.setProperty("confirmed", not transit and confirmed == number)
+        if single:
+            raw = data.get("raw_station")
+            self.station1_label.setText(f"原始站点\n{raw if raw is not None else '—'}")
+            self.station2_label.setText(f"目标站点\n{self.agv_target_input.value()}")
+            station_labels = ((raw, self.station1_label), (self.agv_target_input.value(), self.station2_label))
+        else:
+            self.station1_label.setText("站点 1\n上下料交接")
+            self.station2_label.setText("站点 2\n往返折返点")
+            station_labels = ((1, self.station1_label), (2, self.station2_label))
+        for number, label in station_labels:
+            label.setProperty("confirmed", confirmed is not None and not transit and confirmed == number)
             refresh_style(label)
 
     def _append_log(self, level, message, timestamp=None):
@@ -598,6 +695,8 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.validation_label.clear()
         self.validation_label.hide()
+        self.agv_move_error.clear()
+        self.agv_move_error.hide()
         self._append_log("INFO", "系统设置已保存；保存操作不连接设备。")
 
     def _settings_closed(self, result):

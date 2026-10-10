@@ -183,7 +183,8 @@ class RealBackend:
         level = "ERROR" if report["errors"] else "INFO"
         clear = report["plc_command_clear"]
         clear_text = "无待清命令" if clear is None else acknowledged(clear)
-        self.log(f"PLC 清理：命令清零 {clear_text}；连接关闭 {acknowledged(report['plc_connection_closed'])}。", level)
+        if self.plc is not None:
+            self.log(f"PLC 清理：命令清零 {clear_text}；连接关闭 {acknowledged(report['plc_connection_closed'])}。", level)
         if self.agv_connected:
             result = report["agv"]
             self.log(f"AGV 清理：停止行走应答 {acknowledged(result.get('travel_stop_ack'))}；"
@@ -191,7 +192,8 @@ class RealBackend:
                      f"清目标应答 {acknowledged(result.get('target_clear_ack'))}。", level)
             self.log(f"AGV 行走停车反馈 {acknowledged(result.get('travel_stationary'))}；"
                      f"连接关闭 {acknowledged(result.get('connection_closed'))}。", level)
-        self.log("清理后的滚筒及 PLC 机构停止状态需现场核对。", "WARNING")
+        self.log("清理后的滚筒及 PLC 机构停止状态需现场核对。" if self.plc is not None
+                 else "滚筒机械停止状态需现场核对。", "WARNING")
         if report["errors"]:
             raise CleanupError("；".join(report["errors"]), report)
         return report
