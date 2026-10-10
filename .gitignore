@@ -51,3 +51,6 @@ Thumbs.db
 !gui/assets/triangle-down.svg
 !gui/assets/triangle-up-muted.svg
 !gui/assets/triangle-up.svg
+
+# Documentation screenshots archived from tmp/
+!docs/images/gui/*.png

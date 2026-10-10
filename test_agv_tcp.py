@@ -17,18 +17,25 @@ from agv_tcp import (
 
 class ProtocolTests(unittest.TestCase):
     def test_all_word_command_examples_match_generated_bytes(self):
-        # 直接读用户提供的Word表格作对照，涵盖10个站点、动作及状态查询。
-        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-        with ZipFile(next(Path(__file__).parent.glob("AGV*.docx"))) as document:
-            root = ET.fromstring(document.read("word/document.xml"))
+        # 有原始 Word 时直接核对；无外部文档时核对固定报文，保持测试可独立运行。
+        project = Path(__file__).parent
+        word_path = next(project.glob("AGV*.docx"), None)
         samples = []
-        for row in root.findall(".//w:tr", ns):
-            cells = row.findall("w:tc", ns)
-            if len(cells) != 3:
-                continue
-            text = "".join(t.text or "" for t in cells[2].findall(".//w:t", ns)).strip()
-            if text.startswith("AA "):
-                samples.append(bytes.fromhex(text))
+        if word_path is not None:
+            ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            with ZipFile(word_path) as document:
+                root = ET.fromstring(document.read("word/document.xml"))
+            for row in root.findall(".//w:tr", ns):
+                cells = row.findall("w:tc", ns)
+                if len(cells) != 3:
+                    continue
+                text = "".join(t.text or "" for t in cells[2].findall(".//w:t", ns)).strip()
+                if text.startswith("AA "):
+                    samples.append(bytes.fromhex(text))
+        else:
+            fixture = project / "tests" / "fixtures" / "agv_word_frames.txt"
+            samples = [bytes.fromhex(line) for line in fixture.read_text(encoding="utf-8").splitlines()
+                       if line.strip() and not line.startswith("#")]
         self.assertEqual(len(samples), 18)
         expected = [build_frame(1, 0x06, station) for station in range(1, 11)]
         expected += [build_frame(1, *COMMANDS[name][:2]) for name in (

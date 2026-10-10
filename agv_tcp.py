@@ -150,7 +150,7 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1", help=f"目标 IP；默认本机测试，真实 AGV 文档地址为 {AGV_HOST}")
     parser.add_argument("--port", type=int, default=AGV_PORT, help="目标端口，默认 1024")
     parser.add_argument("--agv-id", type=int, default=1, help="AGV ID，1～255，默认 1")
-    parser.add_argument("--command", required=True, choices=["station", "status", *COMMANDS], help="发送的指令；动作名称对照 AGV测试说明.md")
+    parser.add_argument("--command", required=True, choices=["station", "status", *COMMANDS], help="发送的指令；动作名称对照 Readme.md 的 AGV 协议与单指令测试章节")
     parser.add_argument("--station", type=int, help="目标站点 1～255，调度说明列出 1～10；仅用于 station")
     parser.add_argument("--query-data", type=int, choices=(0, 1), help="仅用于 status：默认 1（Word）；0 为 PDF 示例")
     parser.add_argument("--timeout", type=float, default=5, help="连接/等待应答超时秒数，默认 5")
